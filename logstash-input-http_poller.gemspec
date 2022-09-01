@@ -31,4 +31,6 @@ Gem::Specification.new do |s|
   s.add_development_dependency 'logstash-devutils'
   s.add_development_dependency 'flores'
   s.add_development_dependency 'timecop'
+  s.add_development_dependency "http", "= 3.3.0"
+  s.add_development_dependency "elastic-apm", "~> 4.5"
 end

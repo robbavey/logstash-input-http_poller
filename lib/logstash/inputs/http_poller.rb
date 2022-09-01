@@ -9,6 +9,8 @@ require 'logstash/plugin_mixins/ecs_compatibility_support/target_check'
 require 'logstash/plugin_mixins/validator_support/field_reference_validation_adapter'
 require 'logstash/plugin_mixins/event_support/event_factory_adapter'
 require 'logstash/plugin_mixins/scheduler'
+require 'elastic_apm'
+require_relative '../../manticore/patches/response'
 
 class LogStash::Inputs::HTTP_Poller < LogStash::Inputs::Base
   include LogStash::PluginMixins::HttpClient[:with_deprecated => true]
@@ -190,25 +192,46 @@ class LogStash::Inputs::HTTP_Poller < LogStash::Inputs::Base
   end
 
   def run_once(queue)
+    transaction = ElasticAPM.start_transaction 'http_poller'
+
     @requests.each do |name, request|
       # prevent executing a scheduler kick after the plugin has been stop-ed
       # this could easily happen as the scheduler shutdown is not immediate
       return if stop?
-      request_async(queue, name, request)
+      request_async(queue, name, request, transaction)
     end
 
+    ElasticAPM.start_span 'poll'
     client.execute! unless stop?
+    ElasticAPM.end_span
+
+    ElasticAPM.end_transaction()
   end
 
   private
-  def request_async(queue, name, request)
+  def request_async(queue, name, request, transaction)
     @logger.debug? && @logger.debug("async queueing fetching url", name: name, url: request)
     started = Time.now
 
-    method, *request_opts = request
-    client.async.send(method, *request_opts).
-      on_success {|response| handle_success(queue, name, request, response, Time.now - started) }.
-      on_failure {|exception| handle_failure(queue, name, request, exception, Time.now - started) }
+    method, *request_opts = ElasticAPM.with_span "prepare header" do |span|
+                              header = span.trace_context.traceparent.to_header
+                              request[2][:headers][:traceparent] = header
+                              request
+                            end
+
+    client.async.send(method, *request_opts)
+          .on_success do|response|
+            ElasticAPM.with_span('on_success', parent: transaction, sync: false) {
+              handle_success(queue, name, request, response, Time.now - started)
+            }
+            ElasticAPM.end_span
+          end
+          .on_failure do |exception|
+            ElasticAPM.with_span('on_failure', parent: transaction, sync: false) {
+              handle_failure(queue, name, request, exception, Time.now - started)
+            }
+            ElasticAPM.end_span
+          end
   end
 
   private
