@@ -9,7 +9,6 @@ require 'logstash/plugin_mixins/ecs_compatibility_support/target_check'
 require 'logstash/plugin_mixins/validator_support/field_reference_validation_adapter'
 require 'logstash/plugin_mixins/event_support/event_factory_adapter'
 require 'logstash/plugin_mixins/scheduler'
-require 'elastic_apm'
 require_relative '../../manticore/patches/response'
 
 class LogStash::Inputs::HTTP_Poller < LogStash::Inputs::Base
@@ -192,45 +191,59 @@ class LogStash::Inputs::HTTP_Poller < LogStash::Inputs::Base
   end
 
   def run_once(queue)
-    transaction = ElasticAPM.start_transaction 'http_poller'
+    transaction = Java::co.elastic.apm.api.ElasticApm.startTransaction
+    transaction_name = "input #{config_name}:#{id}"
+    transaction.setName(transaction_name)
+    transaction.setType('input')
+    transaction_scope = transaction.activate
 
     @requests.each do |name, request|
       # prevent executing a scheduler kick after the plugin has been stop-ed
       # this could easily happen as the scheduler shutdown is not immediate
       return if stop?
-      request_async(queue, name, request, transaction)
+      request_async(queue, name, request, transaction, transaction_name)
     end
 
-    ElasticAPM.start_span 'poll'
     client.execute! unless stop?
-    ElasticAPM.end_span
-
-    ElasticAPM.end_transaction()
-  end
+    transaction_scope.close
+    transaction.end
+ end
 
   private
-  def request_async(queue, name, request, transaction)
+  def request_async(queue, name, request, transaction, transaction_name)
     @logger.debug? && @logger.debug("async queueing fetching url", name: name, url: request)
     started = Time.now
 
-    method, *request_opts = ElasticAPM.with_span "prepare header" do |span|
-                              header = span.trace_context.traceparent.to_header
-                              request[2][:headers][:traceparent] = header
-                              request
-                            end
+    header_span = transaction.startSpan
+    header_span.setName("set header")
+    header_scope = header_span.activate
+    headers = {}
+    header_span.injectTraceHeaders do |thename, value|
+      headers[thename] = value
+    end
+    headers["traceparent_name"] = transaction_name
+    header_scope.close
+    header_span.end
+
+    method, *request_opts = request
+    request_opts << { :headers => headers}
 
     client.async.send(method, *request_opts)
           .on_success do|response|
-            ElasticAPM.with_span('on_success', parent: transaction, sync: false) {
+            success_span = transaction.startSpan
+            success_span.setName("on_success")
+            success_span_scope = success_span.activate
               handle_success(queue, name, request, response, Time.now - started)
-            }
-            ElasticAPM.end_span
+            success_span_scope.close
+            success_span.end
           end
-          .on_failure do |exception|
-            ElasticAPM.with_span('on_failure', parent: transaction, sync: false) {
-              handle_failure(queue, name, request, exception, Time.now - started)
-            }
-            ElasticAPM.end_span
+            .on_failure do |exception|
+              failure_span = transaction.startSpan
+              failure_span.setName("on_failure")
+              failure_span_scope = failure_span.activate
+                handle_failure(queue, name, request, exception, Time.now - started)
+              failure_span_scope.close
+              failure_span.end
           end
   end
 

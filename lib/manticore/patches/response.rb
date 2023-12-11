@@ -1,12 +1,14 @@
 # encoding: utf-8
-require 'elastic_apm'
 
 module Manticore
   class Response
     def call
-      env = { 'HTTP_ELASTIC_APM_TRACEPARENT' => @request.headers['traceparent'] }
-      context = ElasticAPM::TraceContext.parse(env: env)
-      ElasticAPM.start_transaction('manticore', trace_context: context)
+      transaction = Java::co.elastic.apm.api.ElasticApm.startTransactionWithRemoteParent do | header_name |
+        @request.headers['traceparent']
+      end
+      transaction.setName("#{@request.headers['traceparent_name']}:manticore")
+      transaction.setType("input")
+      transaction_scope = transaction.activate
 
       return background! if @background
       raise "Already called" if @called
@@ -44,12 +46,13 @@ module Manticore
         @exception ||= ex.new(e)
         @handlers[:failure].call @exception
         execute_complete
-        ElasticAPM.report(@exception)
-        ElasticAPM.end_transaction('exception')
+        transaction_scope.close
+        transaction.end
         nil
       else
         execute_complete
-        ElasticAPM.end_transaction('success')
+        transaction_scope.close
+        transaction.end
         self
       end
 
